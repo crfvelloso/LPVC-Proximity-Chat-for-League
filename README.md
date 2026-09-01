@@ -1,49 +1,119 @@
-# LoL_VPVC Proximity Chat for League (WIP)
-A real-time Proximity Voice Chat for League of Legends. Built with C++ and Node.js, it uses OpenCV to track player positions on the minimap and WebSockets to transmit spatial audio. Voice volume fades dynamically based on in-game distance. Safe, standalone, and requires no game file modifications!
+# LPVC — Proximity Voice Chat for League of Legends
 
-Inspired by the famous VPVC (Valorant Proximity Voice Chat), I decided to bring the same immersive and hilarious experience to the Summoner's Rift. Built entirely from scratch, by a Brazilian developer 🇧🇷, this project is a standalone proximity voice chat for League of Legends.
-It runs entirely in the background, consuming minimal resources, and does not modify any game files or memory, making it completely safe to use.
+Real-time proximity voice chat for League of Legends. Your teammate's voice fades in as they walk toward you on the map, and fades out as they leave. No game files touched, no memory injection — the client reads the minimap the same way you do, with your eyes.
 
-# HOW IT WORKS
+Built from scratch with C++, OpenCV, Node.js and WebSockets.
 
-This project combines Computer Vision, Real-Time Networking, and Low-Level Audio Processing to create spatial audio based on your in-game location.
+![Demo](docs/demo.gif)
 
-Computer Vision (OpenCV): The C++ client constantly captures your screen and reads the LoL minimap. It isolates the white camera bounding box to pinpoint your exact (X, Y) coordinates on the map.
+---
 
-Real-Time Network (Node.js & WebSockets): Your coordinates and raw microphone audio bytes are continuously packed and streamed to a Node.js signaling server.
+## How it works
 
-Spatial Audio (Miniaudio): When your client receives your partner's audio and position, it calculates the geometric distance between both players. If the partner is close, the volume is at 100%. As they move away, the volume dynamically fades out until they are completely muted.
+The client never talks to the game. It watches the screen, finds where you are, and streams that position alongside your microphone audio.
 
-# INSTALLATION & SETUP 
-To play with a friend, one of you will need to host the server (the Host), and both will run the client.
+```mermaid
+flowchart LR
+    A["Screen capture<br/>(C++)"] --> B["OpenCV<br/>minimap parsing"]
+    B --> C["Position (X, Y)"]
+    M["Microphone<br/>(miniaudio)"] --> D
+    C --> D["WebSocket client"]
+    D <--> E["Signaling server<br/>(Node.js)"]
+    E <--> F["Peer client"]
+    F --> G["Distance calculation<br/>+ volume attenuation"]
+    G --> H["Speaker output"]
+```
 
-Prerequisites
-Node.js installed (for the Host).
-Radmin VPN installed and have an account(every player needs to have Radmin VPN).
-The release package containing lol_proximity.exe and the OpenCV .dll file.
+**Computer vision.** The C++ client continuously captures the screen and reads the League minimap, isolating the white camera bounding box to pinpoint your exact `(X, Y)` coordinates on Summoner's Rift.
 
-Step-by-Step Guide
-1. Start the Server (Host Only)
-Open a terminal in the folder containing server.js.
+**Real-time networking.** Coordinates and raw microphone bytes are packed and streamed to a Node.js signaling server over WebSockets.
 
-Run the following command to start the WebSocket server:
+**Spatial audio.** When the client receives a peer's audio and position, it computes the geometric distance between both players. Close by, volume sits at 100%. As the distance grows, volume fades until the peer is fully muted.
 
+Because nothing is read from game memory and no files are patched, the application is a standalone screen reader — it runs in the background with minimal resource usage.
+
+---
+
+## Tech stack
+
+| Layer | Technology |
+| --- | --- |
+| Client | C++ |
+| Computer vision | OpenCV |
+| Audio capture & playback | miniaudio |
+| Transport | WebSockets |
+| Signaling server | Node.js |
+
+---
+
+## Getting started
+
+To play with a friend, one of you hosts the server; both of you run the client.
+
+### Prerequisites
+
+- **Node.js** (host only)
+- **Radmin VPN** (both players) — or any virtual LAN you prefer
+- The release package: `lol_proximity.exe` and `opencv_world4xx.dll`
+
+> The client will not start without the OpenCV DLL in the same folder.
+
+### 1. Start the server (host only)
+
+```bash
+cd LoL_Server
 node server.js
+```
 
-Leave this terminal open in the background.
+Leave the terminal running in the background. The server listens on port `8080`.
 
-2. Create the Multiplayer Tunnel (Host Only)
-To allow your friend to connect to your local server, we will use Radmin VPN (you can choose whatever virtual local area network you prefer) to create a secure tunnel.
+### 2. Create the tunnel (host only)
 
-On Radmin VPN, create a network, and share it with your friends (name and password). then, you will need your friends to copy the ip adress of the machine that is HOSTING THE SERVER. In my case, i host the server on my notebook and play in my desktop, so i will need to join the Radmin network on my pc. when you get the IP adress, write on the LoL_VPVC.exe: ws:\\PASTE-THE-IP-HERE:8080, and press enter.
+The server runs on your local machine, so your friend needs a route to it. Create a network on Radmin VPN and share the name and password. Everyone joins it, then copies the Radmin IP address of the machine **hosting the server**.
 
-3. Run the Client (Both Players)
-Make sure both players have the folder containing lol_proximity.exe and opencv_world4xx.dll (Without the DLL, the app won't open).
-Double-click lol_proximity.exe.
-A command prompt will ask for the server link.
-Paste the Host IP.
-(Example: ws://26.123.69.420:8080)
+### 3. Run the client (both players)
 
-Note: If you are playing alone on the Host PC and just want to test it, simply press ENTER without typing anything to connect to localhost
+Launch `lol_proximity.exe`. When prompted for the server address, paste:
 
-For now, the client is going to be in PT/BR, because i am going to use this with my fellow brazilian friends, so in this moment there is no reason to make an EN version.
+```
+ws://26.14.208.117:8080
+```
+
+Replace the address with the host's Radmin IP. To test alone on the host machine, press `ENTER` with no input to connect to `localhost`.
+
+---
+
+## Project structure
+
+```
+LoL_Server/   Node.js signaling server
+LoL_VPVC/     C++ client — capture, vision, audio
+```
+
+---
+
+## Roadmap
+
+- [ ] Hosted server, removing the Radmin VPN dependency
+- [ ] English client interface (currently PT-BR)
+- [ ] Packaged release with the DLL bundled
+- [ ] Configurable audio falloff curve
+- [ ] Support for more than two players
+
+---
+
+## Why I built this
+
+Inspired by VPVC (Valorant Proximity Voice Chat), I wanted the same immersive — and frequently hilarious — experience on Summoner's Rift. Nothing like it existed for League, so I wrote it. 🇧🇷
+
+---
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
+---
+
+## Disclaimer
+
+This project is not affiliated with or endorsed by Riot Games. It reads only what is rendered on your screen and does not modify game files, memory, or network traffic.
