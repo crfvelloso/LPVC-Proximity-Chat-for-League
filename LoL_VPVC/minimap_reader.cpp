@@ -1,101 +1,182 @@
 #include "minimap_reader.h"
 
+#include <opencv2/imgproc.hpp>
+#include <algorithm>
+#include <cmath>
+
 MinimapReader::MinimapReader() {
-    mapX = 0; mapY = 0; mapWidth = 0; mapHeight = 0;
+    kernel_ = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
 }
 
 MinimapReader::~MinimapReader() {
+    ReleaseGdi();
 }
 
-void MinimapReader::Init(int x, int y, int width, int height) {
-    // Salvamos as coordenadas que o main.cpp nos passar
-    mapX = x;
-    mapY = y;
-    mapWidth = width;
-    mapHeight = height;
-    std::cout << "[MinimapReader] Minimapa configurado na regiao X:" << x << " Y:" << y << std::endl;
+void MinimapReader::GetScreenSize(int& w, int& h) {
+    w = GetSystemMetrics(SM_CXSCREEN);
+    h = GetSystemMetrics(SM_CYSCREEN);
+    if (w <= 0) w = 1920;
+    if (h <= 0) h = 1080;
 }
 
-void MinimapReader::Capture() {
-    // Se a largura ou altura for 0, não tem o que capturar
-    if (mapWidth <= 0 || mapHeight <= 0) return;
-
-    // 1. Prepara as ferramentas do Windows para "ler" a tela
-    HWND hwnd = GetDesktopWindow();
-    HDC hwindowDC = GetDC(hwnd);
-    HDC hwindowCompatibleDC = CreateCompatibleDC(hwindowDC);
-    SetStretchBltMode(hwindowCompatibleDC, COLORONCOLOR);
-
-    // 2. Cria um espaço vazio na memória para jogar a foto
-    HBITMAP hbwindow = CreateCompatibleBitmap(hwindowDC, mapWidth, mapHeight);
-    BITMAPINFOHEADER bi = {0};
-    bi.biSize = sizeof(BITMAPINFOHEADER);
-    bi.biWidth = mapWidth;
-    bi.biHeight = -mapHeight; // Negativo para a imagem não ficar de ponta-cabeça
-    bi.biPlanes = 1;
-    bi.biBitCount = 32;
-    bi.biCompression = BI_RGB;
-
-    SelectObject(hwindowCompatibleDC, hbwindow);
-    
-    // 3. O CLICK DA CÂMERA: Copia os pixels da tela para a nossa memória
-    BitBlt(hwindowCompatibleDC, 0, 0, mapWidth, mapHeight, hwindowDC, mapX, mapY, SRCCOPY);
-
-    // 4. Passa a imagem do Windows para o OpenCV (cv::Mat)
-    frameAtual.create(mapHeight, mapWidth, CV_8UC4);
-    GetDIBits(hwindowCompatibleDC, hbwindow, 0, mapHeight, frameAtual.data, (BITMAPINFO*)&bi, DIB_RGB_COLORS);
-
-    // 5. Limpa a memória (MUITO importante para o PC não travar)
-    DeleteObject(hbwindow);
-    DeleteDC(hwindowCompatibleDC);
-    ReleaseDC(hwnd, hwindowDC);
-
-   // 6. Remove a transparência para o OpenCV trabalhar melhor com as cores
-    cv::cvtColor(frameAtual, frameAtual, cv::COLOR_BGRA2BGR);
-
-
+// O minimapa do LoL fica no canto inferior direito e sua altura acompanha a
+// resolucao (~26% da altura da tela na escala padrao da interface).
+MinimapRegion MinimapReader::AutoDetectRegion() {
+    int sw, sh;
+    GetScreenSize(sw, sh);
+    MinimapRegion r;
+    r.w = r.h = (int)(sh * 0.26f);
+    r.x = sw - r.w;
+    r.y = sh - r.h;
+    return r;
 }
 
-MapPos MinimapReader::FindCentroid(int targetId) {
-    MapPos pos; pos.x = 0; pos.y = 0; pos.is_valid = false;
-    if (frameAtual.empty()) return pos;
+void MinimapReader::Configure(const MinimapRegion& region) {
+    MinimapRegion r = region;
+    int sw, sh;
+    GetScreenSize(sw, sh);
+    r.w = std::clamp(r.w, 64, sw);
+    r.h = std::clamp(r.h, 64, sh);
+    r.x = std::clamp(r.x, 0, sw - r.w);
+    r.y = std::clamp(r.y, 0, sh - r.h);
 
-    cv::Mat hsv;
-    cv::cvtColor(frameAtual, hsv, cv::COLOR_BGR2HSV);
+    if (r.x == region_.x && r.y == region_.y && r.w == region_.w && r.h == region_.h && bitmap_)
+        return;
 
-    cv::Mat maskWhite;
-    cv::inRange(hsv, cv::Scalar(0, 0, 200), cv::Scalar(180, 50, 255), maskWhite);
+    region_ = r;
+    ReleaseGdi();          // recria os recursos GDI no tamanho novo
+    lastX_ = lastY_ = -1.0f;
+    missCount_ = 0;
+}
 
+void MinimapReader::ReleaseGdi() {
+    if (bitmap_)   { DeleteObject(bitmap_); bitmap_ = nullptr; }
+    if (memDc_)    { DeleteDC(memDc_); memDc_ = nullptr; }
+    if (screenDc_) { ReleaseDC(nullptr, screenDc_); screenDc_ = nullptr; }
+}
 
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5));
-    cv::dilate(maskWhite, maskWhite, kernel, cv::Point(-1, -1), 2);
+// Os objetos GDI sao criados uma unica vez, nao a cada quadro: era isso que
+// fazia a captura custar caro no loop antigo.
+bool MinimapReader::EnsureGdi() {
+    if (bitmap_ && memDc_ && screenDc_) return true;
+    if (region_.w <= 0 || region_.h <= 0) return false;
+
+    ReleaseGdi();
+    screenDc_ = GetDC(nullptr);
+    if (!screenDc_) return false;
+    memDc_ = CreateCompatibleDC(screenDc_);
+    if (!memDc_) { ReleaseGdi(); return false; }
+    SetStretchBltMode(memDc_, COLORONCOLOR);
+
+    bitmap_ = CreateCompatibleBitmap(screenDc_, region_.w, region_.h);
+    if (!bitmap_) { ReleaseGdi(); return false; }
+    SelectObject(memDc_, bitmap_);
+
+    bmpInfo_ = {};
+    bmpInfo_.biSize = sizeof(BITMAPINFOHEADER);
+    bmpInfo_.biWidth = region_.w;
+    bmpInfo_.biHeight = -region_.h;    // negativo = origem no topo
+    bmpInfo_.biPlanes = 1;
+    bmpInfo_.biBitCount = 32;
+    bmpInfo_.biCompression = BI_RGB;
+
+    frameBgra_.create(region_.h, region_.w, CV_8UC4);
+    return true;
+}
+
+bool MinimapReader::Capture() {
+    if (!EnsureGdi()) return false;
+    if (!BitBlt(memDc_, 0, 0, region_.w, region_.h, screenDc_, region_.x, region_.y, SRCCOPY)) {
+        ReleaseGdi();      // a sessao pode ter mudado (bloqueio de tela, RDP)
+        return false;
+    }
+    return GetDIBits(memDc_, bitmap_, 0, region_.h, frameBgra_.data,
+                     (BITMAPINFO*)&bmpInfo_, DIB_RGB_COLORS) != 0;
+}
+
+MapPos MinimapReader::FindSelf() {
+    MapPos pos;
+    candidates_ = 0;
+    if (frameBgra_.empty()) return pos;
+
+    // O que rastreamos e o retangulo branco da camera desenhado no minimapa
+    // (ele acompanha o campeao). Como e branco puro, da para procurar direto no
+    // BGRA, sem a conversao para HSV que o codigo antigo fazia a cada quadro.
+    const int b = brightness_;
+    cv::inRange(frameBgra_, cv::Scalar(b, b, b, 0), cv::Scalar(255, 255, 255, 255), mask_);
+    cv::dilate(mask_, mask_, kernel_, cv::Point(-1, -1), 2);
 
     std::vector<std::vector<cv::Point>> contours;
-    cv::findContours(maskWhite, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    cv::findContours(mask_, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
-    double maxArea = 0;
+    float bestScore = -1.0f;
+    int bestX = 0, bestY = 0;
 
-    for (size_t i = 0; i < contours.size(); i++) {
-        cv::Rect box = cv::boundingRect(contours[i]);
-        double area = box.width * box.height; 
-        
-        if (box.width > 40 && box.width < 250 && box.height > 30 && box.height < 200) {
-            int cx = box.x + box.width / 2;
-            int cy = box.y + box.height / 2;
+    for (const auto& contour : contours) {
+        const cv::Rect box = cv::boundingRect(contour);
+        if (box.width < minBox_ || box.width > maxBox_) continue;
+        if (box.height < minBox_ * 3 / 4 || box.height > maxBox_) continue;
 
-            if (area > maxArea) {
-                maxArea = area;
-                pos.x = cx;
-                pos.y = cy;
-                pos.is_valid = true;
-            }
+        // O retangulo da camera e deitado (proporcao da tela); texto e barra de
+        // vida sao muito mais alongados e caem fora dessa faixa.
+        const float aspect = (float)box.width / (float)std::max(1, box.height);
+        if (aspect < 0.7f || aspect > 2.6f) continue;
+
+        candidates_++;
+        const float cx = box.x + box.width * 0.5f;
+        const float cy = box.y + box.height * 0.5f;
+
+        // Pontuacao: area (o maior candidato costuma ser a camera) mais um bonus
+        // por estar perto de onde estavamos no quadro anterior.
+        float score = (float)(box.width * box.height) / (float)(region_.w * region_.h);
+        if (lastX_ >= 0.0f) {
+            const float dx = cx - lastX_, dy = cy - lastY_;
+            const float dist = std::sqrt(dx * dx + dy * dy);
+            score += std::max(0.0f, 1.0f - dist / (region_.w * 0.25f));
+        }
+        if (score > bestScore) {
+            bestScore = score;
+            bestX = (int)cx;
+            bestY = (int)cy;
         }
     }
 
-    // Desenhávamos uma mira aqui, mas desligamos para economizar processamento
-    // A janela principal da Visão do Robô também está desligada abaixo:
-    // cv::imshow("Visao do Robo", frameAtual);
-    // cv::waitKey(1);
+    if (bestScore < 0.0f) {
+        // Tolera algumas falhas seguidas antes de declarar posicao perdida
+        // (pings e animacoes cobrem o retangulo por um ou dois quadros).
+        if (++missCount_ > 8) lastX_ = lastY_ = -1.0f;
+        return pos;
+    }
 
+    missCount_ = 0;
+    // Suavizacao leve, para o volume nao oscilar com o tremor da deteccao.
+    if (lastX_ >= 0.0f) {
+        lastX_ = lastX_ * 0.4f + bestX * 0.6f;
+        lastY_ = lastY_ * 0.4f + bestY * 0.6f;
+    } else {
+        lastX_ = (float)bestX;
+        lastY_ = (float)bestY;
+    }
+
+    pos.x = std::clamp(lastX_ / (float)region_.w, 0.0f, 1.0f);
+    pos.y = std::clamp(lastY_ / (float)region_.h, 0.0f, 1.0f);
+    pos.is_valid = true;
     return pos;
+}
+
+bool MinimapReader::GetPreviewRGBA(std::vector<uint8_t>& out, int& w, int& h) const {
+    if (frameBgra_.empty()) return false;
+    w = frameBgra_.cols;
+    h = frameBgra_.rows;
+    out.resize((size_t)w * h * 4);
+    const uint8_t* src = frameBgra_.data;
+    uint8_t* dst = out.data();
+    const size_t n = (size_t)w * h;
+    for (size_t i = 0; i < n; ++i) {            // BGRA -> RGBA
+        dst[i * 4 + 0] = src[i * 4 + 2];
+        dst[i * 4 + 1] = src[i * 4 + 1];
+        dst[i * 4 + 2] = src[i * 4 + 0];
+        dst[i * 4 + 3] = 255;
+    }
+    return true;
 }
